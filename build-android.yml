@@ -1,0 +1,384 @@
+name: Build Cycle for Android
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pick the newest app version
+        run: |
+          F=$(ls cycle-android-v*.html 2>/dev/null | sort -V | tail -n 1)
+          if [ -z "$F" ] || [ ! -f "$F" ]; then
+            echo "::error::No app file found. Upload cycle-android-vX.html to the top level of the repository."
+            exit 1
+          fi
+          V=$(echo "$F" | sed -E 's/.*-v([0-9]+)\.html/\1/')
+          echo "Building $F (version $V)"
+          echo "APP_FILE=$F" >> $GITHUB_ENV
+          echo "APP_VER=$V" >> $GITHUB_ENV
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Create signing key (first run only)
+        run: |
+          if [ ! -f keystore.jks ]; then
+            keytool -genkeypair -keystore keystore.jks -storepass cycle12345 -keypass cycle12345 \
+              -alias cycle -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Cycle"
+            git config user.name "github-actions"
+            git config user.email "github-actions@users.noreply.github.com"
+            git add keystore.jks
+            git commit -m "Add app signing key [skip ci]"
+            git push
+          fi
+
+      - name: Write Android project
+        run: |
+          P=android/app/src/main
+          mkdir -p $P/java/com/cycle/tracker $P/assets $P/res/values $P/res/values-night $P/res/drawable-nodpi $P/res/mipmap-anydpi-v26
+          cp "$APP_FILE" $P/assets/index.html
+
+          cat > android/settings.gradle << 'G'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = 'Cycle'
+          include ':app'
+          G
+
+          cat > android/build.gradle << 'G'
+          plugins { id 'com.android.application' version '8.5.2' apply false }
+          G
+
+          cat > android/gradle.properties << 'G'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          G
+
+          cat > android/app/build.gradle << 'G'
+          plugins { id 'com.android.application' }
+          def vc = Integer.parseInt((project.findProperty('vCode') ?: '1').toString())
+          def vn = (project.findProperty('vName') ?: '1').toString()
+          android {
+              namespace 'com.cycle.tracker'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'com.cycle.tracker'
+                  minSdk 28
+                  targetSdk 34
+                  versionCode vc
+                  versionName vn
+              }
+              signingConfigs {
+                  release {
+                      storeFile file('../../keystore.jks')
+                      storePassword 'cycle12345'
+                      keyAlias 'cycle'
+                      keyPassword 'cycle12345'
+                  }
+              }
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                      signingConfig signingConfigs.release
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              lint { checkReleaseBuilds false; abortOnError false }
+          }
+          dependencies { implementation 'androidx.webkit:webkit:1.11.0' }
+          G
+
+          cat > $P/AndroidManifest.xml << 'G'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.VIBRATE"/>
+              <application
+                  android:label="Cycle"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher"
+                  android:theme="@style/AppTheme"
+                  android:allowBackup="true">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|uiMode"
+                      android:windowSoftInputMode="adjustResize"/>
+                  <!--ALIASES-->
+              </application>
+          </manifest>
+          G
+
+          cat > $P/java/com/cycle/tracker/MainActivity.java << 'G'
+          package com.cycle.tracker;
+
+          import android.app.Activity;
+          import android.content.ClipData;
+          import android.content.ClipboardManager;
+          import android.content.ComponentName;
+          import android.content.Intent;
+          import android.content.pm.PackageManager;
+          import android.graphics.Color;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.view.View;
+          import android.view.Window;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.ValueCallback;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebResourceResponse;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import androidx.webkit.WebViewAssetLoader;
+
+          public class MainActivity extends Activity {
+              private static final int FILE_REQ = 42;
+              private static final String HOST = "appassets.androidplatform.net";
+              private WebView web;
+              private ValueCallback<Uri[]> fileCallback;
+
+              @Override
+              protected void onCreate(Bundle state) {
+                  super.onCreate(state);
+                  web = new WebView(this);
+                  setContentView(web);
+
+                  final WebViewAssetLoader loader = new WebViewAssetLoader.Builder()
+                      .addPathHandler("/assets/", new WebViewAssetLoader.AssetsPathHandler(this))
+                      .build();
+
+                  WebSettings ws = web.getSettings();
+                  ws.setJavaScriptEnabled(true);
+                  ws.setDomStorageEnabled(true);
+                  ws.setAllowFileAccess(false);
+                  ws.setTextZoom(100);
+
+                  web.addJavascriptInterface(new Bridge(), "Android");
+
+                  web.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public WebResourceResponse shouldInterceptRequest(WebView v, WebResourceRequest r) {
+                          return loader.shouldInterceptRequest(r.getUrl());
+                      }
+                      @Override
+                      public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) {
+                          Uri u = r.getUrl();
+                          if (HOST.equals(u.getHost())) return false;
+                          try { startActivity(new Intent(Intent.ACTION_VIEW, u)); } catch (Exception e) { }
+                          return true;
+                      }
+                  });
+
+                  web.setWebChromeClient(new WebChromeClient() {
+                      @Override
+                      public boolean onShowFileChooser(WebView v, ValueCallback<Uri[]> cb, FileChooserParams params) {
+                          if (fileCallback != null) fileCallback.onReceiveValue(null);
+                          fileCallback = cb;
+                          try {
+                              startActivityForResult(params.createIntent(), FILE_REQ);
+                          } catch (Exception e) {
+                              fileCallback = null;
+                              return false;
+                          }
+                          return true;
+                      }
+                  });
+
+                  web.loadUrl("https://" + HOST + "/assets/index.html");
+              }
+
+              private class Bridge {
+                  private ComponentName alias(String id) {
+                      return new ComponentName(getPackageName(), getPackageName() + ".Icon" + id);
+                  }
+
+                  @JavascriptInterface
+                  public String getAppIcon(String all) {
+                      try {
+                          PackageManager pm = getPackageManager();
+                          String[] ids = all.split(",");
+                          for (String id : ids) {
+                              if (pm.getComponentEnabledSetting(alias(id)) == PackageManager.COMPONENT_ENABLED_STATE_ENABLED) return id;
+                          }
+                          if (ids.length > 0 && pm.getComponentEnabledSetting(alias(ids[0])) != PackageManager.COMPONENT_ENABLED_STATE_DISABLED) return ids[0];
+                      } catch (Exception e) { }
+                      return "Default";
+                  }
+
+                  @JavascriptInterface
+                  public String setAppIcon(String id, String all) {
+                      try {
+                          PackageManager pm = getPackageManager();
+                          pm.setComponentEnabledSetting(alias(id), PackageManager.COMPONENT_ENABLED_STATE_ENABLED, PackageManager.DONT_KILL_APP);
+                          for (String other : all.split(",")) {
+                              if (!other.equals(id)) {
+                                  pm.setComponentEnabledSetting(alias(other), PackageManager.COMPONENT_ENABLED_STATE_DISABLED, PackageManager.DONT_KILL_APP);
+                              }
+                          }
+                          return "ok";
+                      } catch (Exception e) {
+                          return "error";
+                      }
+                  }
+
+                  @JavascriptInterface
+                  @SuppressWarnings("deprecation")
+                  public void setBars(final String hex, final boolean light) {
+                      runOnUiThread(() -> {
+                          try {
+                              int c = Color.parseColor(hex);
+                              Window w = getWindow();
+                              w.setStatusBarColor(c);
+                              w.setNavigationBarColor(c);
+                              web.setBackgroundColor(c);
+                              View d = w.getDecorView();
+                              int f = d.getSystemUiVisibility();
+                              int both = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+                              d.setSystemUiVisibility(light ? (f | both) : (f & ~both));
+                          } catch (Exception e) { }
+                      });
+                  }
+
+                  @JavascriptInterface
+                  public void copy(String text) {
+                      try {
+                          ClipboardManager cm = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+                          cm.setPrimaryClip(ClipData.newPlainText("Cycle backup", text));
+                      } catch (Exception e) { }
+                  }
+              }
+
+              @Override
+              protected void onActivityResult(int req, int res, Intent data) {
+                  if (req == FILE_REQ && fileCallback != null) {
+                      fileCallback.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(res, data));
+                      fileCallback = null;
+                      return;
+                  }
+                  super.onActivityResult(req, res, data);
+              }
+
+              @Override
+              public void onBackPressed() {
+                  web.evaluateJavascript("window.__back ? window.__back() : false", value -> {
+                      if (!"true".equals(value)) finish();
+                  });
+              }
+          }
+          G
+
+          cat > $P/res/values/colors.xml << 'G'
+          <resources>
+              <color name="bg">#F3EEF4</color>
+          </resources>
+          G
+
+          cat > $P/res/values-night/colors.xml << 'G'
+          <resources>
+              <color name="bg">#17131A</color>
+          </resources>
+          G
+
+          cat > $P/res/values/themes.xml << 'G'
+          <resources>
+              <style name="AppTheme" parent="android:Theme.Material.Light.NoActionBar">
+                  <item name="android:windowBackground">@color/bg</item>
+                  <item name="android:statusBarColor">@color/bg</item>
+                  <item name="android:navigationBarColor">@color/bg</item>
+                  <item name="android:windowLightStatusBar">true</item>
+                  <item name="android:windowLightNavigationBar">true</item>
+              </style>
+          </resources>
+          G
+
+          cat > $P/res/values-night/themes.xml << 'G'
+          <resources>
+              <style name="AppTheme" parent="android:Theme.Material.NoActionBar">
+                  <item name="android:windowBackground">@color/bg</item>
+                  <item name="android:statusBarColor">@color/bg</item>
+                  <item name="android:navigationBarColor">@color/bg</item>
+                  <item name="android:windowLightStatusBar">false</item>
+                  <item name="android:windowLightNavigationBar">false</item>
+              </style>
+          </resources>
+          G
+
+      - name: Add app icons
+        run: |
+          python3 - << 'PY'
+          import json, re, base64, os
+          P = 'android/app/src/main'
+          html = open(os.environ['APP_FILE']).read()
+          m = re.search(r'<script type="application/json" id="icon-data">(.*?)</script>', html, re.S)
+          icons = json.loads(m.group(1)) if m else []
+          if not icons:
+              raise SystemExit('No icons found inside the app file')
+          def alias(name, icon, enabled):
+              return ('<activity-alias android:name=".Icon%s" android:targetActivity=".MainActivity" '
+                      'android:icon="%s" android:roundIcon="%s" android:label="Cycle" '
+                      'android:exported="true" android:enabled="%s">'
+                      '<intent-filter><action android:name="android.intent.action.MAIN"/>'
+                      '<category android:name="android.intent.category.LAUNCHER"/></intent-filter>'
+                      '</activity-alias>') % (name, icon, icon, 'true' if enabled else 'false')
+          aliases = []
+          colors = ['<resources>']
+          for i, ic in enumerate(icons):
+              n = ic['id'].lower()
+              src = ic['src']
+              ext = 'png' if src.startswith('data:image/png') else 'jpg'
+              with open('%s/res/drawable-nodpi/icon_%s.%s' % (P, n, ext), 'wb') as f:
+                  f.write(base64.b64decode(src.split(',', 1)[1]))
+              colors.append('<color name="icbg_%s">%s</color>' % (n, ic['bg']))
+              xml = ('<?xml version="1.0" encoding="utf-8"?>'
+                     '<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">'
+                     '<background android:drawable="@color/icbg_%s"/>'
+                     '<foreground android:drawable="@drawable/icon_%s"/></adaptive-icon>' % (n, n))
+              with open('%s/res/mipmap-anydpi-v26/ic_%s.xml' % (P, n), 'w') as f:
+                  f.write(xml)
+              if i == 0:
+                  with open('%s/res/mipmap-anydpi-v26/ic_launcher.xml' % P, 'w') as f:
+                      f.write(xml)
+              aliases.append(alias(ic['id'], '@mipmap/ic_' + n, i == 0))
+          colors.append('</resources>')
+          open(P + '/res/values/icon_colors.xml', 'w').write('\n'.join(colors))
+          mf = P + '/AndroidManifest.xml'
+          text = open(mf).read().replace('<!--ALIASES-->', '\n'.join(aliases))
+          open(mf, 'w').write(text)
+          print('Added %d icons' % len(icons))
+          PY
+
+      - name: Build APK
+        working-directory: android
+        run: gradle assembleRelease -PvCode=${{ github.run_number }} -PvName=${{ env.APP_VER }} --no-daemon
+
+      - name: Rename APK
+        run: cp android/app/build/outputs/apk/release/app-release.apk Cycle.apk
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Cycle Android v${{ env.APP_VER }}
+          body: Download Cycle.apk below and open it on your phone to install or update.
+          files: Cycle.apk
+          make_latest: true
